@@ -3,15 +3,18 @@ const { redisClient } = require("../cache");
 const { authMiddleware, requireRole } = require("../middlewares/auth");
 
 const ALLOWED_SORT_FIELDS = ["id", "course_name", "credit", "created_at"];
-const CACHE_TTL_SECONDS = 120; // รายวิชาไม่ค่อยเปลี่ยน ตั้ง TTL ให้นานกว่าปกติได้ (W7)
+const CACHE_TTL_SECONDS = 120;
 
-// =========================
 // Helper & Middleware
-// =========================
-
 function parseQuery(req) {
   const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100);
+
+  const courseName =
+    req.query.course_name !== undefined && req.query.course_name !== ""
+      ? String(req.query.course_name)
+      : null;
 
   const minCredit =
     req.query.minCredit !== undefined && req.query.minCredit !== ""
@@ -29,33 +32,36 @@ function parseQuery(req) {
     page,
     limit,
     offset: (page - 1) * limit,
+    courseName,
     minCredit,
     sort,
     order,
   };
 }
 
-// [Week 7]: ออกแบบ Cache Key ที่รวมพารามิเตอร์การค้นหา
 function buildCacheKey(query) {
   return [
     "courses:list",
     `page=${query.page}`,
     `limit=${query.limit}`,
+    `course_name=${query.courseName ?? ""}`,
     `minCredit=${query.minCredit ?? ""}`,
     `sort=${query.sort}`,
     `order=${query.order}`,
   ].join(":");
 }
 
-// ใช้ SCAN แทน KEYS เพื่อป้องกัน Redis ค้างเมื่อข้อมูลมีขนาดใหญ่
 async function clearCourseCache() {
   let cursor = "0";
+
   do {
     const reply = await redisClient.scan(cursor, {
       MATCH: "courses:list:*",
       COUNT: 100,
     });
+
     cursor = reply.cursor;
+
     const keys = reply.keys;
 
     if (keys.length > 0) {
@@ -64,112 +70,149 @@ async function clearCourseCache() {
   } while (cursor !== "0");
 }
 
-// [Week 7]: Middleware ตรวจสอบ Header Deprecation สำหรับ V1
 function deprecationWarning(req, res, next) {
   res.set("Deprecation", "@1767225600");
   res.set("Link", '</api/v2/courses>; rel="successor-version"');
   next();
 }
 
-// =========================
-// Routes
-// =========================
-
 module.exports = function registerCourseRoutes(v1Router, v2Router) {
-  // ทุก endpoint ต้องมี JWT
+  // JWT Authentication
   v1Router.use(authMiddleware);
   v2Router.use(authMiddleware);
 
-  // นำ Deprecation middleware ไปใช้เฉพาะกับ v1Router
+  // Auth Me
+  v1Router.get("/auth/me", (req, res) => {
+    let user;
+
+    if (req.user.sub === "u-admin") {
+      user = {
+        id: 1,
+        username: "admin",
+        role: "admin",
+      };
+    } else if (req.user.sub === "u-student") {
+      user = {
+        id: 2,
+        username: "student",
+        role: "student",
+      };
+    } else {
+      return res.status(401).json({
+        error: {
+          code: "UNAUTHORIZED",
+          message: "ไม่พบข้อมูลผู้ใช้งาน",
+        },
+      });
+    }
+
+    return res.status(200).json({
+      message: "เข้าสู่ระบบสำเร็จ",
+      data: user,
+    });
+  });
+
+  // v1 Deprecation
   v1Router.use("/courses", deprecationWarning);
 
-  // =========================================
-  // V1 - GET Courses
-  // Student / Admin ทำได้
-  // =========================================
+  // =========================================================
+  // V1 GET /courses
+  // Admin only
+  // Pagination + Search + Filter + Sort + Cache
+  // =========================================================
+  v1Router.get("/courses", requireRole("admin"), async (req, res, next) => {
+    const query = parseQuery(req);
+    const cacheKey = buildCacheKey(query);
 
-  v1Router.get("/courses", async (req, res, next) => {
     try {
-      const query = parseQuery(req);
-      const cacheKey = buildCacheKey(query);
-
-      // ---------- Cache ----------
+      // Check cache
       const cached = await redisClient.get(cacheKey);
 
       if (cached) {
-        const result = JSON.parse(cached);
+        const parsed = JSON.parse(cached);
+
         return res.status(200).json({
           message: "สำเร็จ (จาก cache)",
-          data: result.rows,
-          pagination: result.pagination,
+          data: parsed.rows,
+          pagination: parsed.pagination,
         });
       }
 
-      // ---------- Database ----------
-      let where = "";
+      // Build conditions
+      const conditions = [];
       const params = [];
 
-      if (query.minCredit !== null && Number.isFinite(query.minCredit)) {
-        where = "WHERE credit >= ?";
+      // Search course name
+      if (query.courseName) {
+        conditions.push("course_name LIKE ?");
+        params.push(`%${query.courseName}%`);
+      }
+
+      // Filter minimum credit
+      if (Number.isFinite(query.minCredit)) {
+        conditions.push("credit >= ?");
         params.push(query.minCredit);
       }
 
-      const [rows] = await pool.query(
-        `
-        SELECT *
-        FROM courses
-        ${where}
-        ORDER BY ${query.sort} ${query.order}
-        LIMIT ? OFFSET ?
-        `,
-        [...params, query.limit, query.offset],
-      );
+      const where = conditions.length
+        ? `WHERE ${conditions.join(" AND ")}`
+        : "";
 
+      // Count total
       const [countRows] = await pool.query(
-        `
-        SELECT COUNT(*) AS total
-        FROM courses
-        ${where}
-        `,
+        `SELECT COUNT(*) AS total
+         FROM courses
+         ${where}`,
         params,
       );
 
       const total = countRows[0].total;
       const totalPages = Math.ceil(total / query.limit);
 
-      const pagination = {
-        page: query.page,
-        limit: query.limit,
-        total,
-        totalPages,
+      // Get courses
+      const [rows] = await pool.query(
+        `SELECT id, course_name, credit, created_at
+         FROM courses
+         ${where}
+         ORDER BY ${query.sort} ${query.order}
+         LIMIT ? OFFSET ?`,
+        [...params, query.limit, query.offset],
+      );
+
+      const payload = {
+        rows,
+        pagination: {
+          page: query.page,
+          limit: query.limit,
+          total,
+          totalPages,
+        },
       };
 
-      const result = { rows, pagination };
-
-      // ---------- Save Cache ----------
-      await redisClient.set(cacheKey, JSON.stringify(result), {
+      // Save cache
+      await redisClient.set(cacheKey, JSON.stringify(payload), {
         EX: CACHE_TTL_SECONDS,
       });
 
       return res.status(200).json({
         message: "สำเร็จ (จากฐานข้อมูล)",
         data: rows,
-        pagination,
+        pagination: payload.pagination,
       });
     } catch (err) {
       next(err);
     }
   });
 
-  // =========================================
-  // V1 - POST Courses
-  // เฉพาะ Admin
-  // =========================================
-
+  // =========================================================
+  // V1 POST /courses
+  // Admin only
+  // Transaction
+  // =========================================================
   v1Router.post("/courses", requireRole("admin"), async (req, res, next) => {
     const { course_name, credit, prerequisites = [] } = req.body;
 
-    // ---------- Validation ----------
+    // Validation
     if (
       !course_name ||
       !Number.isInteger(Number(credit)) ||
@@ -193,57 +236,58 @@ module.exports = function registerCourseRoutes(v1Router, v2Router) {
       });
     }
 
-    let connection;
+    let conn;
 
     try {
-      connection = await pool.getConnection();
+      conn = await pool.getConnection();
 
-      // เช็คว่ารหัสวิชาใน prerequisites มีอยู่จริงใน Database หรือไม่
+      // Check prerequisite courses
       if (prerequisites.length > 0) {
         const placeholders = prerequisites.map(() => "?").join(",");
-        const [existingCourses] = await connection.query(
-          `SELECT id FROM courses WHERE id IN (${placeholders})`,
+
+        const [existingCourses] = await conn.query(
+          `SELECT id
+           FROM courses
+           WHERE id IN (${placeholders})`,
           prerequisites,
         );
 
         if (existingCourses.length !== prerequisites.length) {
-          // ปล่อยให้ finally จัดการ release connection
           return res.status(400).json({
             error: {
               code: "VALIDATION_ERROR",
-              message: "รหัสวิชา prerequisite บางตัวไม่มีอยู่ในระบบ",
+              message: "พบ prerequisites ที่ไม่มีอยู่ในระบบ",
             },
           });
         }
       }
 
-      // ---------- Transaction ----------
-      await connection.beginTransaction();
+      // Start transaction
+      await conn.beginTransaction();
 
-      const [result] = await connection.query(
-        `
-          INSERT INTO courses (course_name, credit)
-          VALUES (?, ?)
-          `,
+      // Insert course
+      const [result] = await conn.query(
+        `INSERT INTO courses (course_name, credit)
+         VALUES (?, ?)`,
         [course_name, Number(credit)],
       );
 
       const courseId = result.insertId;
 
-      // ---------- Insert Prerequisites ----------
+      // Insert prerequisites
       for (const prereqId of prerequisites) {
-        await connection.query(
-          `
-            INSERT INTO course_prerequisites (course_id, prereq_course_id)
-            VALUES (?, ?)
-            `,
+        await conn.query(
+          `INSERT INTO course_prerequisites
+           (course_id, prereq_course_id)
+           VALUES (?, ?)`,
           [courseId, prereqId],
         );
       }
 
-      await connection.commit();
+      // Commit
+      await conn.commit();
 
-      // ---------- Clear Cache ----------
+      // Clear Redis cache
       await clearCourseCache();
 
       return res.status(201).json({
@@ -256,95 +300,108 @@ module.exports = function registerCourseRoutes(v1Router, v2Router) {
         },
       });
     } catch (err) {
-      if (connection) {
-        // ห่อ try/catch ป้องกัน rollback() throw error แล้วหลุดจาก middleware
+      // Rollback
+      if (conn) {
         try {
-          await connection.rollback();
-        } catch (rollbackErr) {
-          console.error("Rollback failed:", rollbackErr);
-        }
+          await conn.rollback();
+        } catch (_) {}
       }
+
       next(err);
     } finally {
-      if (connection) {
-        connection.release();
+      // Release connection
+      if (conn) {
+        conn.release();
       }
     }
   });
 
-  // =========================================
-  // V2 - GET Courses
-  // Student / Admin ทำได้
-  // =========================================
-
+  // =========================================================
+  // V2 GET /courses
+  // Different response structure
+  // Pagination + Search + Filter + Sort + Cache
+  // =========================================================
   v2Router.get("/courses", async (req, res, next) => {
-    try {
-      const query = parseQuery(req);
-      const cacheKey = buildCacheKey(query);
+    const query = parseQuery(req);
+    const cacheKey = buildCacheKey(query);
 
+    try {
+      // Check cache
       const cached = await redisClient.get(cacheKey);
 
-      let result;
-
       if (cached) {
-        result = JSON.parse(cached);
-      } else {
-        let where = "";
-        const params = [];
+        const parsed = JSON.parse(cached);
 
-        if (query.minCredit !== null && Number.isFinite(query.minCredit)) {
-          where = "WHERE credit >= ?";
-          params.push(query.minCredit);
-        }
-
-        const [rows] = await pool.query(
-          `
-          SELECT *
-          FROM courses
-          ${where}
-          ORDER BY ${query.sort} ${query.order}
-          LIMIT ? OFFSET ?
-          `,
-          [...params, query.limit, query.offset],
-        );
-
-        const [countRows] = await pool.query(
-          `
-          SELECT COUNT(*) AS total
-          FROM courses
-          ${where}
-          `,
-          params,
-        );
-
-        const total = countRows[0].total;
-        const totalPages = Math.ceil(total / query.limit);
-
-        result = {
-          rows,
-          pagination: {
-            page: query.page,
-            limit: query.limit,
-            total,
-            totalPages,
-          },
-        };
-
-        await redisClient.set(cacheKey, JSON.stringify(result), {
-          EX: CACHE_TTL_SECONDS,
+        return res.status(200).json({
+          items: parsed.rows,
+          count: parsed.rows.length,
+          pagination: parsed.pagination,
         });
       }
 
-      // V2 โครงสร้าง Response ต่างจาก V1
+      // Build conditions
+      const conditions = [];
+      const params = [];
+
+      // Search course name
+      if (query.courseName) {
+        conditions.push("course_name LIKE ?");
+        params.push(`%${query.courseName}%`);
+      }
+
+      // Filter minimum credit
+      if (Number.isFinite(query.minCredit)) {
+        conditions.push("credit >= ?");
+        params.push(query.minCredit);
+      }
+
+      const where = conditions.length
+        ? `WHERE ${conditions.join(" AND ")}`
+        : "";
+
+      // Count total
+      const [countRows] = await pool.query(
+        `SELECT COUNT(*) AS total
+         FROM courses
+         ${where}`,
+        params,
+      );
+
+      const total = countRows[0].total;
+      const totalPages = Math.ceil(total / query.limit);
+
+      // Get courses
+      const [rows] = await pool.query(
+        `SELECT id, course_name, credit, created_at
+         FROM courses
+         ${where}
+         ORDER BY ${query.sort} ${query.order}
+         LIMIT ? OFFSET ?`,
+        [...params, query.limit, query.offset],
+      );
+
+      const payload = {
+        rows,
+        pagination: {
+          page: query.page,
+          limit: query.limit,
+          total,
+          totalPages,
+        },
+      };
+
+      // Save cache
+      await redisClient.set(cacheKey, JSON.stringify(payload), {
+        EX: CACHE_TTL_SECONDS,
+      });
+
       return res.status(200).json({
-        items: result.rows,
-        count: result.rows.length,
-        pagination: result.pagination,
+        items: rows,
+        count: rows.length,
+        pagination: payload.pagination,
       });
     } catch (err) {
       next(err);
     }
   });
-
-  registerCourseRoutes.ALLOWED_SORT_FIELDS = ALLOWED_SORT_FIELDS;
 };
